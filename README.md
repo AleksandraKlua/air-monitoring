@@ -1,4 +1,4 @@
-# This is the air monitoring system with Arduino UNO & Grafana.
+# Air monitoring system with Arduino UNO & Grafana.
 ### Metrics to be control:
 - air temprature;
 - air humidity;
