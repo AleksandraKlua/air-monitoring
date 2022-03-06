@@ -1,15 +1,27 @@
 #include <Arduino.h>
-#include <WiFi.h>
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <ESP8266WiFiMulti.h>
 #include <NTPClient.h>
-#include <HTTPClient.h>
+#include <ESP8266HTTPClient.h>
 #include <DHT.h>
-#include <HCSR04.h>
 #include <LedControl.h>
 #include "config.h" // Configuration file
+#include <InfluxDbClient.h>
+#include <InfluxDbCloud.h>
 
 // NTP Client
 WiFiUDP ntpUDP;
 NTPClient ntpClient(ntpUDP);
+
+// WiFi
+ESP8266WiFiMulti wifiMulti;
+
+// InfluxDB client instance with preconfigured InfluxCloud certificate
+InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN, InfluxDbCloud2CACert);
+
+// Data point
+Point sensor("wifi_status");
 
 // Loki & Influx Clients
 HTTPClient httpInflux;
@@ -18,10 +30,10 @@ HTTPClient httpGraphite;
 
 // Sensors
 DHT dht(DHT_PIN, DHT_TYPE);
-UltraSonicDistanceSensor distanceSensor(ULTRASONIC_PIN_TRIG, ULTRASONIC_PIN_ECHO);
 
 // LED
-LedControl lc = LedControl(LED_PIN, LED_CLK, LED_CS, 0); // (first 3 arguments are the pin-numbers: dataPin,clockPin,csPin,numDevices)
+LedControl lc = LedControl(LED_PIN, LED_CLK, LED_CS,
+                           0); // (first 3 arguments are the pin-numbers: dataPin,clockPin,csPin,numDevices)
 
 // LED visualisations
 byte smile[8] = {0x3C, 0x42, 0xA5, 0x81, 0xA5, 0x99, 0x42, 0x3C};
@@ -36,44 +48,67 @@ void setupWiFi() {
     Serial.print(WIFI_SSID);
     Serial.print("' ...");
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+//  WiFi.mode(WIFI_STA);
+    wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+
+    while (wifiMulti.run() != WL_CONNECTED) {
         Serial.print(".");
+        delay(100);
     }
 
     Serial.println("connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+
+    // Add tags
+    sensor.addTag("device", DEVICE);
+    sensor.addTag("SSID", WiFi.SSID());
+}
+
+void connectToInflux() {
+    // Add tags
+    sensor.addTag("device", DEVICE);
+    sensor.addTag("SSID", WiFi.SSID());
+
+    // Accurate time is necessary for certificate validation and writing in batches
+    // For the fastest time sync find NTP servers in your area: https://www.pool.ntp.org/zone/
+    // Syncing progress and the time will be printed to Serial.
+    timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");
+
+    // Check server connection
+    if (client.validateConnection()) {
+        Serial.print("Connected to InfluxDB: ");
+        Serial.println(client.getServerUrl());
+    } else {
+        Serial.print("InfluxDB connection failed: ");
+        Serial.println(client.getLastErrorMessage());
+    }
 }
 
 // Function to submit metrics to Influx
-void submitToInflux(unsigned long ts, float cels, float hum, float hic, int moist, long height, float light) {
+void submitToInflux(unsigned long ts, float cels, float hum, float hic) {
     String influxClient =
-            String("https://") + INFLUX_HOST + "/api/v2/write?org=" + INFLUX_ORG_ID + "&bucket=" + INFLUX_BUCKET +
-            "&precision=s";
+            String(INFLUXDB_URL) + "/api/v2/write?org=" + INFLUXDB_ORG + "&bucket=" + INFLUXDB_BUCKET + "&precision=s";
+    Serial.printf("Influx [HTTPS] POST URL: ", influxClient);
     String body = String("temperature value=") + cels + " " + ts + "\n" + "humidity value=" + hum + " " + ts + "\n" +
-                  "index value=" + hic + " " + ts + "\n" + "moisture value=" + moist + " " + ts + "\n" +
-                  "light value=" + light + " " + ts + "\n" + "height value=" + height + " " + ts;
+                  "index value=" + hic + " " + ts + "\n";
 
     // Submit POST request via HTTP
     httpInflux.begin(influxClient);
-    httpInflux.addHeader("Authorization", INFLUX_TOKEN);
+    httpInflux.addHeader("Authorization", INFLUXDB_TOKEN);
     int httpCode = httpInflux.POST(body);
     Serial.printf("Influx [HTTPS] POST...  Code: %d\n", httpCode);
     httpInflux.end();
 }
 
 // Function to submit logs to Loki
-void
-submitToLoki(unsigned long ts, float cels, float hum, float hic, int moist, long height, float light, String message) {
+void submitToLoki(unsigned long ts, float cels, float hum, float hic, String message) {
     String lokiClient =
             String("https://") + LOKI_USER + ":" + LOKI_API_KEY + "@logs-prod-us-central1.grafana.net/loki/api/v1/push";
     String body =
-            String("{\"streams\": [{ \"stream\": { \"plant_id\": \"2020_12_17\", \"monitoring_type\": \"avocado\"}, \"values\": [ [ \"") +
-            ts + "000000000\", \"" + "temperature=" + cels + " humidity=" + hum + " heat_index=" + hic +
-            " soil_moisture=" + moist + " height=" + height + " light=" + light + " status=" + message + "\" ] ] }]}";
+            String("{\"streams\": [{ \"stream\": { \"date\": \"2022_03_06\", \"monitoring_type\": \"air\"}, \"values\": [ [ \"") +
+            ts + "000000000\", \"" + "temperature=" + cels + " humidity=" + hum + " heat_index=" + hic + " status=" +
+            message + "\" ] ] }]}";
 
     // Submit POST request via HTTP
     httpLoki.begin(lokiClient);
@@ -84,7 +119,7 @@ submitToLoki(unsigned long ts, float cels, float hum, float hic, int moist, long
 }
 
 // Function to submit logs to Graphite
-void submitToGraphite(unsigned long ts, float cels, float hum, float hic, int moist, long height, float light) {
+void submitToGraphite(unsigned long ts, float cels, float hum, float hic) {
     // build hosted metrics json payload
     String body = String("[") +
                   "{\"name\":\"temperature\",\"interval\":" + INTERVAL + ",\"value\":" + cels +
@@ -92,16 +127,10 @@ void submitToGraphite(unsigned long ts, float cels, float hum, float hic, int mo
                   "{\"name\":\"humidity\",\"interval\":" + INTERVAL + ",\"value\":" + hum +
                   ",\"mtype\":\"gauge\",\"time\":" + ts + "}," +
                   "{\"name\":\"heat_index\",\"interval\":" + INTERVAL + ",\"value\":" + hic +
-                  ",\"mtype\":\"gauge\",\"time\":" + ts + "}," +
-                  "{\"name\":\"moisture\",\"interval\":" + INTERVAL + ",\"value\":" + moist +
-                  ",\"mtype\":\"gauge\",\"time\":" + ts + "}," +
-                  "{\"name\":\"height\",\"interval\":" + INTERVAL + ",\"value\":" + height +
-                  ",\"mtype\":\"gauge\",\"time\":" + ts + "}," +
-                  "{\"name\":\"light\",\"interval\":" + INTERVAL + ",\"value\":" + light +
                   ",\"mtype\":\"gauge\",\"time\":" + ts + "}]";
 
     // submit POST request via HTTP
-    httpGraphite.begin("https://graphite-us-central1.grafana.net/metrics");
+    httpGraphite.begin("https://graphite-prod-01-eu-west-0.grafana.net/graphite/metrics");
     httpGraphite.setAuthorization(GRAPHITE_USER, GRAPHITE_API_KEY);
     httpGraphite.addHeader("Content-Type", "application/json");
 
@@ -113,7 +142,7 @@ void submitToGraphite(unsigned long ts, float cels, float hum, float hic, int mo
 // Function to display state of the plant on LED Matrix
 void displayState(byte character[]) {
     unsigned long currHour = ntpClient.getHours();
-    bool shouldDisplay = (currHour < 21 && currHour > 8);   // Turn off in the night
+    bool shouldDisplay = (currHour < 23 && currHour > 8);   // Turn off in the night
     if (shouldDisplay) {
         for (int i = 0; i < 8; i++) {
             lc.setRow(0, i, character[i]);
@@ -125,23 +154,9 @@ void displayState(byte character[]) {
     }
 }
 
-// Function to read soil moisture measurement
-int getSoilMoisture() {
-    // Turn the sensor ON
-    digitalWrite(MOISTURE_POWER, HIGH);
-    // Allow power to settle
-    delay(10);
-    // Read the digital value form sensor
-    int val = digitalRead(MOISTURE_PIN);
-    // Turn the sensor OFF
-    digitalWrite(MOISTURE_POWER, LOW);
-    // Return moisture value
-    return val;
-}
-
 // Function to check if any reading failed
-bool checkIfReadingFailed(float hum, float cels, int moist, double height, float light) {
-    if (isnan(hum) || isnan(cels) || isnan(moist) || isnan(height) || isnan(light)) {
+bool checkIfReadingFailed(float hum, float cels) {
+    if (isnan(hum) || isnan(cels)) {
         // Print letter E as error
         displayState(error);
         Serial.println(F("Failed to read from some sensor!"));
@@ -151,16 +166,16 @@ bool checkIfReadingFailed(float hum, float cels, int moist, double height, float
 }
 
 // Function to create message and display current state of the plant
-String createAndDisplayState(int moist, float cels) {
+String createAndDisplayState(int hic) {
     String currentState = "";
-    if (moist) {
-        currentState = "DRY critical";
+    if (hic >= 54) {
+        currentState = "Serious risk to health";
         displayState(sad);
-    } else if (cels < 16) {
-        currentState = "COLD warning";
+    } else if (hic >= 32) {
+        currentState = "Prolonged exposure and activity could lead to heatstroke";
         displayState(neutral);
-    } else if (cels > 26) {
-        currentState = "HOT warning";
+    } else if (hic >= 27) {
+        currentState = "Prolonged exposure and activity may lead to heatstroke";
         displayState(neutral);
     } else {
         currentState = "OK info";
@@ -173,12 +188,14 @@ String createAndDisplayState(int moist, float cels) {
 // ========== MAIN FUNCTIONS: SETUP & LOOP ==========
 // SETUP: Function called at boot to initialize the system
 void setup() {
-
     // Start the serial output at 115,200 baud
     Serial.begin(115200);
 
     // Connect to WiFi
     setupWiFi();
+
+    // Connect to InfluxDB
+    connectToInflux();
 
     // Initialize a NTPClient to get time
     ntpClient.begin();
@@ -199,6 +216,7 @@ void loop() {
         WiFi.disconnect();
         yield();
         setupWiFi();
+        connectToInflux();
     }
 
     // Update time via NTP if required
@@ -217,21 +235,22 @@ void loop() {
     float cels = dht.readTemperature();
 
     // Check if any reads failed and return early
-    if (checkIfReadingFailed(hum, cels, moist, height, light)) {
+    if (checkIfReadingFailed(hum, cels)) {
         return;
     }
 
     // Compute heat index in Celsius (isFahrenheit = false)
     float hic = dht.computeHeatIndex(cels, hum, false);
 
-    // Convert data to state of the plant
-    String message = createAndDisplayState(moist, cels);
+    // Convert data to state of the air
+    String message = createAndDisplayState(hic);
 
     // Submit data
-    submitToInflux(ts, cels, hum, hic, moist, height, light);
-    submitToGraphite(ts, cels, hum, hic, moist, height, light);
-    submitToLoki(ts, cels, hum, hic, moist, height, light, message);
+    submitToInflux(ts, cels, hum, hic);
+    submitToGraphite(ts, cels, hum, hic);
+    submitToLoki(ts, cels, hum, hic, message);
 
     // wait INTERVAL seconds, then do it again
+    Serial.println("Wait 10s");
     delay(INTERVAL * 1000);
 }
