@@ -1,41 +1,36 @@
 #include <Arduino.h>
+#include "config.h"
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
-#include <DHT.h>
-#include <MHZ.h>
-#include <WiFiClient.h>
 #include <SoftwareSerial.h>
-#include "config.h"
-
-#define SENSOR "DHT22"
-#define CO2_SENSOR "MHZ19B"
-// pin for pwm reading
-#define CO2_IN 14
+#include <MHZ.h>
+#include <DHT.h>
+#include <WiFiClient.h>
+#include <string.h>
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
 
-// Set timezone string according to https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
-// Set timezone to St.Petersburg, Russia
-#define TZ_INFO "MST-3MDT,M3.5.0/2,M10.5.0/3"
-
 ESP8266WiFiMulti wifiMulti;
-
-int rxPin = 0;
-int txPin = 1;
-SoftwareSerial esp(rxPin, txPin);
-
+SoftwareSerial esp(RX_PIN, TX_PIN);
 DHT dht(DHT_PIN, DHT_TYPE);
-MHZ co2(CO2_IN, MHZ19B);
+MHZ mhz(MHZ_PIN, MHZ_TYPE);
 
 // InfluxDB client instance with preconfigured InfluxCloud certificate
 InfluxDBClient influxDbClient(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN, InfluxDbCloud2CACert);
-
 // Data point
-Point sensor("air_state");
+Point point("air_state");
+Point point2("air_state");
 
+byte buff[2];
+unsigned long duration;
+unsigned long startTime;
+unsigned long endTime;
 unsigned long currentTime;
-
+unsigned long sampleTimeMs = 3000;
+unsigned long lowPulseOccupancy = 0;
+float ratio = 0;
+float concentration = 0;
 
 void setup() {
 
@@ -65,26 +60,28 @@ void setup() {
     Serial.println();
     Serial.println();
 
-    pinMode(CO2_IN, INPUT);
+    pinMode(MHZ_PIN, INPUT);
+
+    // MH-Z19B must heating before work for almost two minutes
     esp.println("MHZ 19B");
-    if (co2.isPreHeating()) {
+    if (mhz.isPreHeating()) {
         esp.print("Preheating");
-        while (co2.isPreHeating()) {
+        while (mhz.isPreHeating()) {
             esp.print(".");
-            delay(5000);
+            delay(10000);
         }
-        esp.println();
     }
 
     Serial.println();
     Serial.println();
     Serial.println();
 
-    //currentTime = millis()/1000;
+    startTime = millis()/1000;
 
     // Add tags
-    sensor.addTag("sensor", SENSOR);
-    //sensor.addTag("co2sensor", CO2_SENSOR);
+    point.addTag("dhtSensor", DHT_SENSOR);
+    point.addTag("co2Sensor", CO2_SENSOR);
+    //   point.addTag("dustSensor", DUST_SENSOR);
 
     // Accurate time is necessary for certificate validation and writing in batches
     // For the fastest time sync find NTP servers in your area: https://www.pool.ntp.org/zone/
@@ -93,43 +90,58 @@ void setup() {
 
     // Check server connection
     if (influxDbClient.validateConnection()) {
-        esp.print("Connected to InfluxDB: ");
+        esp.println("Connected to InfluxDB: ");
         esp.println(influxDbClient.getServerUrl());
     } else {
-        esp.print("InfluxDB connection failed: ");
+        esp.println("InfluxDB connection failed: ");
         esp.println(influxDbClient.getLastErrorMessage());
     }
 }
 
 void loop() {
     // Clear fields for reusing the point. Tags will remain untouched
-    sensor.clearFields();
+    point.clearFields();
+    //point2.clearFields();
 
     float hum = dht.readHumidity();
     float temp = dht.readTemperature();
     float hic = dht.computeHeatIndex(temp, hum, false);
     esp.println("Writing: temp = " + String(temp) + ", hum = " + String(hum) + ", hic = " + String(hic));
 
-    esp.print("\n----- Time from start: ");
-    esp.print(millis() / 1000);
-    esp.println(" s");
+    esp.println("\n----- Time from start: ");
+    esp.print(startTime);
+    esp.print(" s");
 
-    int ppm_pwm = co2.readCO2PWM();
-    esp.print("PPMpwm: ");
-    esp.print(ppm_pwm);
-    esp.println("\n------------------------------");
+    currentTime = millis() / 1000;
+    esp.println("\n----- Current time: ");
+    esp.print(currentTime);
+    esp.print(" s");
+
+    int ppmPwm = 0;
+    if ((currentTime - startTime) >= 120) {
+        ppmPwm = mhz.readCO2PWM();
+        esp.println("PPMpwm: ");
+        esp.print(ppmPwm);
+        esp.println("\n------------------------------");
+        startTime =  millis() / 1000;
+    }
+
     //delay(5000);
 
     // Store measured value into point
     // Report RSSI of currently connected network
-    sensor.addField("temperature", temp);
-    sensor.addField("humidity", hum);
-    sensor.addField("hic", hic);
-    sensor.addField("co2", ppm_pwm);
+    point.addField("temperature", temp);
+    point.addField("humidity", hum);
+    point.addField("hic", hic);
+    if(ppmPwm != 0) {
+        point.addField("co2", ppmPwm);
+    }
 
     // Print what are we exactly writing
-    Serial.print("Writing: ");
-    Serial.println(sensor.toLineProtocol());
+    esp.println("Writing: ");
+    esp.println(point.toLineProtocol());
+//    esp.println("Writing2: ");
+//    esp.println(point2.toLineProtocol());
 
     // Check WiFi connection and reconnect if needed
     if (wifiMulti.run() != WL_CONNECTED) {
@@ -137,26 +149,70 @@ void loop() {
     }
 
     // Write point
-    if (!influxDbClient.writePoint(sensor)) {
+    if (!influxDbClient.writePoint(point)) {
         esp.print("InfluxDB write failed: ");
         esp.println(influxDbClient.getLastErrorMessage());
     }
 
     esp.println("Wait 10s");
     delay(10000);
-
-    // Construct a Flux query
+    // Construct a Flux queries
     // Query will find the worst RSSI for last hour for each connected WiFi network with this device
-    String query = "from(bucket: \"air\") \
-    |> range(start: -1h) \
-    |> filter(fn: (r) => r._measurement == \"air_state\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\" and r._field == \"co2\") \
-    |> min()";
-    // Print composed query
-    esp.print("Querying with: ");
-    esp.println(query);
+    // A query for DHT22
+    String query;
+    if(ppmPwm != 0) {
+        // A query for MHZ19B
+        query = "from(bucket: \"air\") \
+        |> range(start: -1h) \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"dhtSensor\") \
+        |> filter(fn: (r) => r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"co2Sensor\") \
+        |> filter(fn: (r) => r._field == \"co2\") \
+        |> min()";
+        // Print composed query
+        esp.println("Querying with: ");
+        esp.println(query);
+//        // Print output header
+//        esp.println("==========");
+//        // Send query to the server and get result
+//        FluxQueryResult result = influxDbClient.query(query);
+//
+//        // Iterate over rows. Even there is just one row, next() must be called at least once.
+//        while (result.next()) {
+//            // Get converted value for the _time column
+//            FluxDateTime time = result.getValueByName("_time").getDateTime();
+//
+//            // Format date-time for printing
+//            // Format string according to http://www.cplusplus.com/reference/ctime/strftime/
+//            String timeStr = time.format("%F %T");
+//
+//            esp.print(" at ");
+//            esp.print(timeStr);
+//
+//            esp.println();
+//        }
+//        // Check if there was an error
+//        if(result.getError() != "") {
+//            Serial.print("Query result error: ");
+//            Serial.println(result.getError());
+//        }
+//
+//        // Close the result
+//        result.close();
+    } else {
+        query  = "from(bucket: \"air\") \
+        |> range(start: -1h) \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"dhtSensor\") \
+        |> filter(fn: (r) => r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
+        |> min()";
+        // Print composed query
+        esp.println("Querying with DHT22 only: ");
+        esp.println(query);
+    }
 
-    // Print ouput header
-    esp.print("==========");
+
+    // Print output header
+    esp.println("==========");
     // Send query to the server and get result
     FluxQueryResult result = influxDbClient.query(query);
 
