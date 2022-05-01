@@ -11,7 +11,7 @@
 #define MHZ_PIN 14 // pin for pwm reading
 #define MHZ_TYPE MHZ19B
 // DSM501A sensor
-#define DUST_PIN 6
+#define DUST_PIN 4
 // WIFI
 #define WIFI_SSID "wifiname"
 #define WIFI_PASSWORD "password"
