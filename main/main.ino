@@ -21,6 +21,7 @@ InfluxDBClient influxDbClient(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLU
 // Data point
 Point point("air_state");
 Point point2("air_state");
+Point point3("air_state");
 
 byte buff[2];
 unsigned long duration;
@@ -61,7 +62,6 @@ void setup() {
     Serial.println();
 
     pinMode(MHZ_PIN, INPUT);
-
     // MH-Z19B must heating before work for almost two minutes
     esp.println("MHZ 19B");
     if (mhz.isPreHeating()) {
@@ -76,12 +76,15 @@ void setup() {
     Serial.println();
     Serial.println();
 
-    startTime = millis()/1000;
+    pinMode(DUST_PIN,INPUT);
+
+    startTime = millis();
+    currentTime = millis();
 
     // Add tags
-    point.addTag("dhtSensor", DHT_SENSOR);
-    point.addTag("co2Sensor", CO2_SENSOR);
-    //   point.addTag("dustSensor", DUST_SENSOR);
+    point.addTag("sensor", DHT_SENSOR);
+    point2.addTag("sensor", CO2_SENSOR);
+    point3.addTag("sensor", DUST_SENSOR);
 
     // Accurate time is necessary for certificate validation and writing in batches
     // For the fastest time sync find NTP servers in your area: https://www.pool.ntp.org/zone/
@@ -101,32 +104,57 @@ void setup() {
 void loop() {
     // Clear fields for reusing the point. Tags will remain untouched
     point.clearFields();
-    //point2.clearFields();
+    point2.clearFields();
+    point3.clearFields();
 
     float hum = dht.readHumidity();
     float temp = dht.readTemperature();
     float hic = dht.computeHeatIndex(temp, hum, false);
     esp.println("Writing: temp = " + String(temp) + ", hum = " + String(hum) + ", hic = " + String(hic));
 
-    esp.println("\n----- Time from start: ");
-    esp.print(startTime);
-    esp.print(" s");
+    String dust;
+    duration = pulseIn(DUST_PIN, LOW);
+    lowPulseOccupancy += duration;
+    endTime = millis();
+    if ((endTime-currentTime) > sampleTimeMs){
+        ratio = lowPulseOccupancy/(sampleTimeMs*10.0);  // Integer percentage 0=>100
+        concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve
 
-    currentTime = millis() / 1000;
-    esp.println("\n----- Current time: ");
-    esp.print(currentTime);
-    esp.print(" s");
-
-    int ppmPwm = 0;
-    if ((currentTime - startTime) >= 120) {
-        ppmPwm = mhz.readCO2PWM();
-        esp.println("PPMpwm: ");
-        esp.print(ppmPwm);
-        esp.println("\n------------------------------");
-        startTime =  millis() / 1000;
+        esp.print("lowpulseoccupancy: ");
+        esp.print(lowPulseOccupancy);
+        esp.print(" ratio: ");
+        esp.print(ratio);
+        esp.print(" DSM501A: ");
+        esp.println(concentration);
+        lowPulseOccupancy = 0;
+        currentTime = millis();
+        if (concentration < 1000) {
+            dust = "CLEAN";
+            esp.print("CLEAN");
+        } else if (concentration > 1000 && concentration < 10000) {
+            dust = "GOOD";
+            esp.print("GOOD");
+        } else if (concentration > 10000 && concentration < 20000) {
+            dust = "ACCEPTABLE";
+            esp.print("ACCEPTABLE");
+        } else if (concentration > 20000 && concentration < 50000) {
+            dust = "HEAVY";
+            esp.print("HEAVY");
+        } else if (concentration > 50000 ) {
+            dust = "HAZARD";
+            esp.print("HAZARD");
+        }
     }
 
-    //delay(5000);
+    int ppmPwm = 0;
+    esp.println("Time: ");
+    esp.println(String(millis() - startTime));
+    if(120000 <= millis() - startTime) {
+        ppmPwm = mhz.readCO2PWM();
+        esp.println("PPMpwm: " + String(ppmPwm));
+        esp.println("\n------------------------------");
+        startTime = millis();
+    }
 
     // Store measured value into point
     // Report RSSI of currently connected network
@@ -134,14 +162,15 @@ void loop() {
     point.addField("humidity", hum);
     point.addField("hic", hic);
     if(ppmPwm != 0) {
-        point.addField("co2", ppmPwm);
+        point2.addField("co2", ppmPwm);
     }
+    point3.addField("dust", dust);
 
     // Print what are we exactly writing
-    esp.println("Writing: ");
-    esp.println(point.toLineProtocol());
-//    esp.println("Writing2: ");
-//    esp.println(point2.toLineProtocol());
+//    esp.println("Writing: ");
+//    esp.println(point.toLineProtocol());
+//    esp.println("Writing3: ");
+//    esp.println(point3.toLineProtocol());
 
     // Check WiFi connection and reconnect if needed
     if (wifiMulti.run() != WL_CONNECTED) {
@@ -153,21 +182,31 @@ void loop() {
         esp.print("InfluxDB write failed: ");
         esp.println(influxDbClient.getLastErrorMessage());
     }
+    if (!influxDbClient.writePoint(point3)) {
+        esp.print("InfluxDB write failed: ");
+        esp.println(influxDbClient.getLastErrorMessage());
+    }
 
-    esp.println("Wait 10s");
-    delay(10000);
+//    esp.println("Wait 10s");
+//    delay(10000);
     // Construct a Flux queries
     // Query will find the worst RSSI for last hour for each connected WiFi network with this device
     // A query for DHT22
     String query;
     if(ppmPwm != 0) {
+//        esp.println("Writing: ");
+//        esp.println(point2.toLineProtocol());
+        // Write point
+        if (!influxDbClient.writePoint(point2)) {
+            esp.print("InfluxDB write failed: ");
+            esp.println(influxDbClient.getLastErrorMessage());
+        }
         // A query for MHZ19B
         query = "from(bucket: \"air\") \
         |> range(start: -1h) \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"dhtSensor\") \
-        |> filter(fn: (r) => r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"co2Sensor\") \
-        |> filter(fn: (r) => r._field == \"co2\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"co2\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"dust\") \
         |> min()";
         // Print composed query
         esp.println("Querying with: ");
@@ -202,11 +241,11 @@ void loop() {
     } else {
         query  = "from(bucket: \"air\") \
         |> range(start: -1h) \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"dhtSensor\") \
-        |> filter(fn: (r) => r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"dust\") \
         |> min()";
         // Print composed query
-        esp.println("Querying with DHT22 only: ");
+        esp.println("Querying with DHT22 and DSM501A: ");
         esp.println(query);
     }
 
@@ -239,6 +278,6 @@ void loop() {
     // Close the result
     result.close();
 
-    esp.println("Wait 10s");
-    delay(10000);
+    esp.println("Wait 30s");
+    delay(30000);
 }
