@@ -25,8 +25,3 @@
 #define DHT_SENSOR "DHT22"
 #define CO2_SENSOR "MHZ19B"
 #define DUST_SENSOR "DSM501A"
-// Loki
-#define LOKI_USER "user"
-#define LOKI_API_KEY "token"
-// Metrics
-#define INTERVAL 30
