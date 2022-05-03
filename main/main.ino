@@ -32,7 +32,6 @@ Point co2Point("air_state");
 Point dustPoint("air_state");
 
 void setup() {
-
     Serial.begin(115200);
     esp.begin(9600);
 
@@ -46,15 +45,7 @@ void setup() {
     WiFi.mode(WIFI_STA);
     wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 
-//    Serial.println();
-//    Serial.println();
-//    Serial.println();
-
     dht.begin();
-
-//    Serial.println();
-//    Serial.println();
-//    Serial.println();
 
     pinMode(MHZ_PIN, INPUT);
     // MH-Z19B must heating before work for almost two minutes
@@ -65,10 +56,6 @@ void setup() {
             delay(10000);
         }
     }
-
-//    Serial.println();
-//    Serial.println();
-//    Serial.println();
 
     pinMode(DUST_PIN,INPUT);
 
@@ -99,11 +86,57 @@ void loop() {
     co2Point.clearFields();
     dustPoint.clearFields();
 
+    storeDhtValuesIntoPoint();
+    storeDustConcentrationIntoPoint();
+
+    // Check WiFi connection and reconnect if needed
+    if (wifiMulti.run() != WL_CONNECTED) {
+        esp.println("Wifi connection lost");
+    }
+
+    esp.println("Time: " + String(millis() - startTime));
+    if(120000 <= millis() - startTime) {
+        storeCo2IntoPoint();
+        // Write point
+        checkWritingPointToInflux(co2Point, "co2Point");
+        // A query with MHZ19B
+        String co2Query = createFluxQuery("\"co2\"");
+        // Print query
+        esp.println("CO2 querying with:\n" + co2Query);
+        
+        sendQuery(co2Query);
+    }
+    
+    // Write points
+    checkWritingPointToInflux(dhtPoint, "dhtPoint");
+    checkWritingPointToInflux(dustPoint, "dustPoint");
+    // Construct a Flux queries
+    // Query will find the worst RSSI for last hour for each connected WiFi network with this device
+    String dhtQuery = createFluxQuery("\"temperature\" and r._field == \"humidity\" and r._field == \"hic\"");
+    String dustQuery = createFluxQuery("\"concentration\"");
+    // Print composed query
+    esp.println("DHT querying with:\n" + dhtQuery);
+    esp.println("DUST querying with:\n" + dustQuery);
+
+    sendQuery(dhtQuery);
+    sendQuery(dustQuery);
+
+    esp.println("Wait 20s");
+    delay(20000);
+}
+
+void storeDhtValuesIntoPoint() {
     float hum = dht.readHumidity();
     float temp = dht.readTemperature();
     float hic = dht.computeHeatIndex(temp, hum, false);
     esp.println("Writing: temp = " + String(temp) + ", hum = " + String(hum) + ", hic = " + String(hic));
+    // Store measured value into point
+    dhtPoint.addField("temperature", temp);
+    dhtPoint.addField("humidity", hum);
+    dhtPoint.addField("hic", hic);
+}
 
+void storeDustConcentrationIntoPoint() {
     duration = pulseIn(DUST_PIN, LOW);
     lowPulseOccupancy += duration;
     endTime = millis();
@@ -117,88 +150,47 @@ void loop() {
         esp.println(ratio);
         esp.print("concentration: ");
         esp.println(concentration);
-        
+
         lowPulseOccupancy = 0;
         currentTime = millis();
     }
-
-    int ppmPwm = 0;
-    esp.println("Time: ");
-    esp.println(String(millis() - startTime));
-    if(120000 <= millis() - startTime) {
-        ppmPwm = mhz.readCO2PWM();
-        esp.println("PPMpwm: " + String(ppmPwm));
-        startTime = millis();
-    }
-
-    // Store measured value into point
-    dhtPoint.addField("temperature", temp);
-    dhtPoint.addField("humidity", hum);
-    dhtPoint.addField("hic", hic);
     dustPoint.addField("concentration", concentration);
-    if(ppmPwm != 0) {
-        co2Point.addField("co2", ppmPwm);
-    }
+}
 
-    // Check WiFi connection and reconnect if needed
-    if (wifiMulti.run() != WL_CONNECTED) {
-        esp.println("Wifi connection lost");
-    }
+void storeCo2IntoPoint() {
+    int ppmPwm = mhz.readCO2PWM();
+    esp.println("PPMpwm: " + String(ppmPwm));
+    startTime = millis();
+    co2Point.addField("co2", ppmPwm);
+}
 
-    // Write points
-    if (!influxDbClient.writePoint(dhtPoint)) {
-        esp.println("InfluxDB write dhtPoint failed: " + influxDbClient.getLastErrorMessage());
-    }
-    if (!influxDbClient.writePoint(dustPoint)) {
-        esp.println("InfluxDB write dustPoint failed: " + influxDbClient.getLastErrorMessage());
-    }
-
-    // Construct a Flux queries
-    // Query will find the worst RSSI for last hour for each connected WiFi network with this device
-    String query;
-    if(ppmPwm != 0) {
-        if (!influxDbClient.writePoint(co2Point)) {
-            esp.println("InfluxDB write co2Point failed: " + influxDbClient.getLastErrorMessage());
-        }
-        // A query with MHZ19B
-        query = "from(bucket: \"air\") \
+String createFluxQuery(String fieldsName) {
+    return "from(bucket: \"air\") \
         |> range(start: -1h) \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"co2\") \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"concentration\") \
-        |> min()";
-    } else {
-        query  = "from(bucket: \"air\") \
-        |> range(start: -1h) \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
-        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"concentration\") \
-        |> min()";
-    }
-    // Print composed query
-    esp.println("Querying with:\n" + query);
+        |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == " + fieldsName + ")";
+}
 
-    // Send query to the server and get result
+void checkWritingPointToInflux(Point point, String pointName) {
+    if (!influxDbClient.writePoint(point)) {
+        esp.println("InfluxDB write "+ pointName +" failed: " + influxDbClient.getLastErrorMessage());
+    }
+}
+
+void sendQuery(String query) {
     FluxQueryResult result = influxDbClient.query(query);
-
     // Iterate over rows. Even there is just one row, next() must be called at least once.
     while (result.next()) {
         // Get converted value for the _time column
         FluxDateTime time = result.getValueByName("_time").getDateTime();
-
         // Format date-time for printing
         // Format string according to http://www.cplusplus.com/reference/ctime/strftime/
         String timeStr = time.format("%F %T");
-
         esp.print(" at " + timeStr);
     }
     // Check if there was an error
     if(result.getError() != "") {
         esp.println("Query result error:\n" + result.getError());
     }
-
     // Close the result
     result.close();
-
-    esp.println("Wait 20s");
-    delay(20000);
 }
