@@ -2,15 +2,12 @@
 #include "config.h"
 #include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClientSecureBearSSL.h>
 #include <SoftwareSerial.h>
 #include <MHZ.h>
 #include <DHT.h>
 #include <string.h>
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
 
 ESP8266WiFiMulti wifiMulti;
 SoftwareSerial esp(RX_PIN, TX_PIN);
@@ -29,11 +26,6 @@ float concentration = 0;
 
 // InfluxDB client instance with preconfigured InfluxCloud certificate
 InfluxDBClient influxDbClient(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN, InfluxDbCloud2CACert);
-// NTP Client
-WiFiUDP ntpUDP;
-NTPClient ntpClient(ntpUDP);
-// Loki logs client
-HTTPClient httpLoki;
 // Data point
 Point dhtPoint("air_state");
 Point co2Point("air_state");
@@ -51,24 +43,18 @@ void setup() {
         serialTimeout++;
     }
 
-//    for (uint8_t t = 4; t > 0; t--) {
-//        Serial.printf("[SETUP] WAIT %d...\n", t);
-//        Serial.flush();
-//        delay(1000);
-//    }
-
     WiFi.mode(WIFI_STA);
     wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 
-    Serial.println();
-    Serial.println();
-    Serial.println();
+//    Serial.println();
+//    Serial.println();
+//    Serial.println();
 
     dht.begin();
 
-    Serial.println();
-    Serial.println();
-    Serial.println();
+//    Serial.println();
+//    Serial.println();
+//    Serial.println();
 
     pinMode(MHZ_PIN, INPUT);
     // MH-Z19B must heating before work for almost two minutes
@@ -80,9 +66,9 @@ void setup() {
         }
     }
 
-    Serial.println();
-    Serial.println();
-    Serial.println();
+//    Serial.println();
+//    Serial.println();
+//    Serial.println();
 
     pinMode(DUST_PIN,INPUT);
 
@@ -99,18 +85,11 @@ void setup() {
     // Syncing progress and the time will be printed to Serial.
     timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");
 
-    // Initialize a NTPClient to get time
-    ntpClient.begin();
-
     // Check server connection
     if (influxDbClient.validateConnection()) {
-        String logStr = "Connected to InfluxDB: " + String (influxDbClient.getServerUrl());
-        esp.println(logStr);
-        //esp.println(influxDbClient.getServerUrl());
+        esp.println("Connected to InfluxDB: " + String (influxDbClient.getServerUrl()));
     } else {
-        String logStr = "InfluxDB connection failed: " + String (influxDbClient.getLastErrorMessage());
-        esp.println(logStr);
-        //esp.println(influxDbClient.getLastErrorMessage());
+        esp.println("InfluxDB connection failed: " + String (influxDbClient.getLastErrorMessage()));
     }
 }
 
@@ -125,30 +104,6 @@ void loop() {
     float hic = dht.computeHeatIndex(temp, hum, false);
     esp.println("Writing: temp = " + String(temp) + ", hum = " + String(hum) + ", hic = " + String(hic));
 
-    // Get current timestamp
-    unsigned long ts = ntpClient.getEpochTime();
-    esp.println("Current timestamp: " + String(ts));
-    unsigned char* buf1 = new unsigned char[100];
-    unsigned char* buf2 = new unsigned char[100];
-    String lokiUrl = String("https://") + LOKI_USER + ":" + LOKI_API_KEY + "@" + LOKI_URI + "/loki/api/v1/push";
-    String body = String("{\"streams\": [{ \"stream\": {\"monitoring_type\": \"air\"}, \"values\": [ [ \"") + ts + "000000000\", \"" + "temp=" + String(temp) + ", hum=" + String(hum) + ", hic=" + String(hic) + "\" ] ] }]}";
-
-    esp.println("Submit POST request via HTTP...");
-    // Submit POST request via HTTP
-    std::unique_ptr<BearSSL::WiFiClientSecure>lokiClient(new BearSSL::WiFiClientSecure);
-    lokiClient->setInsecure();
-    httpLoki.begin(*lokiClient,lokiUrl);
-    httpLoki.addHeader("Content-Type", "application/json");
-    esp.println("Added header...");
-    (String(LOKI_USER)).getBytes(buf1, 100, 0);
-    (String(LOKI_API_KEY)).getBytes(buf2, 100, 0);
-    httpLoki.setAuthorization((const char*)buf1, (const char*)buf2);
-    esp.println("Set authorization...");
-    int httpCode = httpLoki.POST(body);
-    esp.println("Loki [HTTPS] POST...  Code: ");
-    esp.print(httpCode);
-    httpLoki.end();
-
     duration = pulseIn(DUST_PIN, LOW);
     lowPulseOccupancy += duration;
     endTime = millis();
@@ -156,12 +111,13 @@ void loop() {
         ratio = lowPulseOccupancy/(sampleTimeMs*10.0);  // Integer percentage 0=>100
         concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve
 
-        esp.println("lowpulseoccupancy: ");
-        esp.print(lowPulseOccupancy);
-        esp.print(" ratio: ");
-        esp.print(ratio);
-        esp.print(" concentration: ");
+        esp.print("lowPulseOccupancy: ");
+        esp.println(lowPulseOccupancy);
+        esp.print("ratio: ");
+        esp.println(ratio);
+        esp.print("concentration: ");
         esp.println(concentration);
+        
         lowPulseOccupancy = 0;
         currentTime = millis();
     }
@@ -172,19 +128,17 @@ void loop() {
     if(120000 <= millis() - startTime) {
         ppmPwm = mhz.readCO2PWM();
         esp.println("PPMpwm: " + String(ppmPwm));
-        esp.println("\n------------------------------");
         startTime = millis();
     }
 
     // Store measured value into point
-    // Report RSSI of currently connected network
     dhtPoint.addField("temperature", temp);
     dhtPoint.addField("humidity", hum);
     dhtPoint.addField("hic", hic);
+    dustPoint.addField("concentration", concentration);
     if(ppmPwm != 0) {
         co2Point.addField("co2", ppmPwm);
     }
-    dustPoint.addField("concentration", concentration);
 
     // Check WiFi connection and reconnect if needed
     if (wifiMulti.run() != WL_CONNECTED) {
@@ -193,24 +147,20 @@ void loop() {
 
     // Write points
     if (!influxDbClient.writePoint(dhtPoint)) {
-        esp.print("InfluxDB write dhtPoint failed: ");
-        esp.println(influxDbClient.getLastErrorMessage());
+        esp.println("InfluxDB write dhtPoint failed: " + influxDbClient.getLastErrorMessage());
     }
     if (!influxDbClient.writePoint(dustPoint)) {
-        esp.print("InfluxDB write dustPoint failed: ");
-        esp.println(influxDbClient.getLastErrorMessage());
+        esp.println("InfluxDB write dustPoint failed: " + influxDbClient.getLastErrorMessage());
     }
 
     // Construct a Flux queries
     // Query will find the worst RSSI for last hour for each connected WiFi network with this device
-    // A query for DHT22
     String query;
     if(ppmPwm != 0) {
         if (!influxDbClient.writePoint(co2Point)) {
-            esp.print("InfluxDB write co2Point failed: ");
-            esp.println(influxDbClient.getLastErrorMessage());
+            esp.println("InfluxDB write co2Point failed: " + influxDbClient.getLastErrorMessage());
         }
-        // A query for MHZ19B
+        // A query with MHZ19B
         query = "from(bucket: \"air\") \
         |> range(start: -1h) \
         |> filter(fn: (r) => r._measurement == \"air_state\" and r.tag == \"sensor\" and r._field == \"temperature\" and r._field == \"humidity\" and r._field == \"hic\") \
@@ -225,8 +175,7 @@ void loop() {
         |> min()";
     }
     // Print composed query
-    esp.println("Querying with: ");
-    esp.println(query);
+    esp.println("Querying with:\n" + query);
 
     // Send query to the server and get result
     FluxQueryResult result = influxDbClient.query(query);
@@ -240,13 +189,11 @@ void loop() {
         // Format string according to http://www.cplusplus.com/reference/ctime/strftime/
         String timeStr = time.format("%F %T");
 
-        esp.print(" at ");
-        esp.print(timeStr);
+        esp.print(" at " + timeStr);
     }
     // Check if there was an error
     if(result.getError() != "") {
-        esp.println("Query result error: ");
-        esp.println(result.getError());
+        esp.println("Query result error:\n" + result.getError());
     }
 
     // Close the result
