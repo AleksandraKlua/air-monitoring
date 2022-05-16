@@ -19,7 +19,7 @@ unsigned long duration;
 unsigned long startTime;
 unsigned long endTime;
 unsigned long currentTime;
-unsigned long sampleTimeMs = 3000;
+unsigned long sampleTimeMs = 30000;
 unsigned long lowPulseOccupancy = 0;
 float ratio = 0;
 float concentration = 0;
@@ -137,12 +137,12 @@ void storeDhtValuesIntoPoint() {
 }
 
 void storeDustConcentrationIntoPoint() {
-    duration = pulseIn(DUST_PIN, LOW);
+    duration = pulseIn(DUST_PIN, LOW); // in µs
     lowPulseOccupancy += duration;
     endTime = millis();
     if ((endTime-currentTime) > sampleTimeMs){
-        ratio = lowPulseOccupancy/(sampleTimeMs*10.0);  // Integer percentage 0=>100
-        concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve
+        ratio = lowPulseOccupancy/(sampleTimeMs*10.0);  // 1s * 1e-6 / (3*10)s * 100% = 1s / (3 * 1e5)s
+        concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve mg/m3
 
         esp.print("lowPulseOccupancy: ");
         esp.println(lowPulseOccupancy);
