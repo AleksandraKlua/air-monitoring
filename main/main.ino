@@ -5,7 +5,6 @@
 #include <SoftwareSerial.h>
 #include <MHZ.h>
 #include <DHT.h>
-#include <string.h>
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
 
@@ -14,7 +13,6 @@ SoftwareSerial esp(RX_PIN, TX_PIN);
 DHT dht(DHT_PIN, DHT_TYPE);
 MHZ mhz(MHZ_PIN, MHZ_TYPE);
 
-byte buff[2];
 unsigned long duration;
 unsigned long startTime;
 unsigned long endTime;
@@ -37,8 +35,8 @@ void setup() {
 
     // Wait 5s for serial connection or continue without it
     uint8_t serialTimeout;
-    while (!Serial && serialTimeout < 50) {
-        delay(100);
+    while (!Serial && serialTimeout < 5) {
+        delay(1000);
         serialTimeout++;
     }
 
@@ -53,7 +51,10 @@ void setup() {
         esp.print("MH-Z19B preheating");
         while (mhz.isPreHeating()) {
             esp.print(".");
-            delay(10000);
+            digitalWrite(LED_BUILTIN, LOW);
+            delay(1000);
+            digitalWrite(LED_BUILTIN, HIGH);
+            delay(9000);
         }
     }
 
@@ -103,10 +104,11 @@ void loop() {
         String co2Query = createFluxQuery("\"co2\"");
         // Print query
         esp.println("CO2 querying with:\n" + co2Query);
-        
+
         sendQuery(co2Query);
+        delay(1000); //send request in one second to avoid esp8266 overloading
     }
-    
+
     // Write points
     checkWritingPointToInflux(dhtPoint, "dhtPoint");
     checkWritingPointToInflux(dustPoint, "dustPoint");
@@ -119,6 +121,7 @@ void loop() {
     esp.println("DUST querying with:\n" + dustQuery);
 
     sendQuery(dhtQuery);
+    delay(1000); //send request in one second
     sendQuery(dustQuery);
 
     esp.println("Wait 20s");
